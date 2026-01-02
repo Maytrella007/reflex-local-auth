@@ -32,7 +32,8 @@ class LoginState(LocalAuthState):
         Returns:
             The validated next URL or empty string if invalid.
         """
-        next_param = self.router.page.params.get("next", "")
+        # Use router.url.query_parameters for Reflex 0.8.x
+        next_param = self.router.url.query_parameters.get("next", "")
         if next_param and is_safe_redirect_url(next_param):
             return next_param
         return ""
