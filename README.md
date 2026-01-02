@@ -2,6 +2,14 @@
 
 Easy access to local authentication in your [Reflex](https://reflex.dev) app.
 
+## Features
+
+- **Local User Management**: Create, authenticate, and manage users with bcrypt password hashing
+- **Session Management**: Secure session tokens with configurable expiration
+- **HttpOnly Cookie Support**: Protect against XSS attacks with server-side authentication (NEW!)
+- **ASGI Middleware**: Server-side route protection that eliminates content flash (NEW!)
+- **Return URL Support**: `?next=` parameter for post-login redirects (NEW!)
+
 ## Installation
 
 ```bash
@@ -55,6 +63,56 @@ def need2login(request):
 Although this _seems_ to protect the content, it is still publicly accessible
 when viewing the source code for the page! This should be considered a mechanism
 to redirect users to the login page, NOT a way to protect data.
+
+### Server-Side Authentication with Middleware (Recommended)
+
+For production applications, use the `AuthMiddleware` to validate authentication
+on the server **before** any page content is sent to the browser. This:
+
+1. **Eliminates content flash**: Users never see protected pages before redirect
+2. **Protects against XSS**: Uses HttpOnly cookies that JavaScript cannot access
+3. **Supports return URLs**: The `?next=` parameter remembers where users were going
+
+```python
+import reflex as rx
+import reflex_local_auth
+
+# Configure the middleware (optional)
+reflex_local_auth.configure_middleware(
+    public_routes={"/login", "/register", "/about"},  # Routes that don't require auth
+    login_route="/login",
+    default_authenticated_route="/dashboard",
+    cookie_secure=True,  # Set to True in production with HTTPS
+)
+
+# Add middleware to your app
+app = rx.App(
+    api_transformer=reflex_local_auth.AuthMiddleware,
+)
+```
+
+**How it works:**
+
+```
+Without Middleware (flash):
+  Request → Server sends HTML → Browser renders → JavaScript checks auth → Redirect
+                                      ↑ FLASH
+
+With Middleware (no flash):
+  Request → Middleware checks cookie → [Valid: Serve page] or [Invalid: HTTP 302 redirect]
+                                        ↑ No content sent before auth check
+```
+
+**Configuration Options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `public_routes` | `{"/login", "/register", ...}` | Routes that don't require authentication |
+| `public_prefixes` | `("/_next/", "/static/", ...)` | URL prefixes that don't require auth |
+| `login_route` | `"/login"` | Where to redirect unauthenticated users |
+| `default_authenticated_route` | `"/"` | Where to redirect authenticated users from login page |
+| `cookie_secure` | `False` | Set `True` in production (requires HTTPS) |
+| `enabled` | `True` | Enable/disable the middleware |
 
 ### Protect State
 
@@ -254,3 +312,54 @@ the new tables and before dropping the old tables:
     op.execute("INSERT INTO localuser SELECT * FROM user;")
     op.execute("INSERT INTO localauthsession SELECT * FROM authsession;")
 ```
+
+## Security Best Practices
+
+### HttpOnly Cookies vs localStorage
+
+| Storage Method | XSS Protection | Server-Side Access |
+|---------------|----------------|-------------------|
+| localStorage (default) | Vulnerable | No |
+| HttpOnly Cookie (with middleware) | Protected | Yes |
+
+When using the `AuthMiddleware`, session tokens are stored in HttpOnly cookies
+that JavaScript cannot access, protecting against XSS token theft.
+
+### Recommended Production Setup
+
+```python
+import reflex as rx
+import reflex_local_auth
+
+# 1. Configure middleware for production
+reflex_local_auth.configure_middleware(
+    cookie_secure=True,  # Requires HTTPS
+    public_routes={"/login", "/register"},
+)
+
+# 2. Add middleware to app
+app = rx.App(
+    api_transformer=reflex_local_auth.AuthMiddleware,
+)
+
+# 3. Still use @require_login as defense-in-depth
+@rx.page()
+@reflex_local_auth.require_login
+def protected_page():
+    return rx.text("Protected content")
+```
+
+### Open Redirect Prevention
+
+The `?next=` parameter is validated to prevent open redirect attacks:
+- Only relative URLs are allowed (must start with `/`)
+- Protocol injection is blocked (`://`)
+- Path traversal is blocked (`..`)
+
+## Contributing
+
+Contributions are welcome! Please open an issue or submit a pull request.
+
+## License
+
+MIT License
