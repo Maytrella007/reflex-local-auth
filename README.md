@@ -512,6 +512,11 @@ Login attempts are rate limited to prevent brute force attacks:
 
 Rate-limited requests receive HTTP 429 with a `Retry-After` header.
 
+**Note:** Rate limiting uses in-memory storage, which means:
+- Limits reset on server restart
+- In multi-worker deployments, each worker has separate limits
+- For production with high-security requirements, consider adding Redis-backed rate limiting
+
 ## Contributing
 
 Contributions are welcome! Please open an issue or submit a pull request.
