@@ -66,8 +66,8 @@ to redirect users to the login page, NOT a way to protect data.
 
 ### Server-Side Authentication with Middleware (Recommended)
 
-For production applications, use the `AuthMiddleware` to validate authentication
-on the server **before** any page content is sent to the browser. This:
+For production applications, use the `AuthMiddleware` with the Auth API to validate
+authentication on the server **before** any page content is sent to the browser. This:
 
 1. **Eliminates content flash**: Users never see protected pages before redirect
 2. **Protects against XSS**: Uses HttpOnly cookies that JavaScript cannot access
@@ -85,10 +85,47 @@ reflex_local_auth.configure_middleware(
     cookie_secure=True,  # Set to True in production with HTTPS
 )
 
-# Add middleware to your app
+# Add middleware AND auth API to your app
 app = rx.App(
-    api_transformer=reflex_local_auth.AuthMiddleware,
+    api_transformer=lambda api: reflex_local_auth.setup_auth_api(
+        reflex_local_auth.AuthMiddleware(api)
+    ),
 )
+```
+
+### Authentication API Endpoints
+
+The library provides REST API endpoints for authentication that set true HttpOnly
+cookies (not accessible by JavaScript):
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/auth/login` | POST | Authenticate and set HttpOnly session cookie |
+| `/api/auth/logout` | POST | Clear session cookie and invalidate session |
+| `/api/auth/me` | GET | Get current authenticated user info |
+
+**Login Request:**
+```javascript
+const response = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'user', password: 'pass' }),
+    credentials: 'include'  // Important: include cookies
+});
+const data = await response.json();
+// { success: true, message: "Login successful", user_id: 1, username: "user" }
+```
+
+**Check Authentication:**
+```javascript
+const response = await fetch('/api/auth/me', { credentials: 'include' });
+const data = await response.json();
+// { authenticated: true, user_id: 1, username: "user", enabled: true }
+```
+
+**Logout:**
+```javascript
+await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
 ```
 
 **How it works:**
@@ -315,15 +352,20 @@ the new tables and before dropping the old tables:
 
 ## Security Best Practices
 
-### HttpOnly Cookies vs localStorage
+### Authentication Architecture
 
-| Storage Method | XSS Protection | Server-Side Access |
-|---------------|----------------|-------------------|
-| localStorage (default) | Vulnerable | No |
-| HttpOnly Cookie (with middleware) | Protected | Yes |
+The library uses a dual-storage pattern for optimal security and compatibility:
 
-When using the `AuthMiddleware`, session tokens are stored in HttpOnly cookies
-that JavaScript cannot access, protecting against XSS token theft.
+| Storage | Purpose | XSS Protection |
+|---------|---------|----------------|
+| localStorage | Reflex WebSocket auth & state hydration | Vulnerable |
+| HttpOnly Cookie | Server-side middleware validation | Protected |
+
+**Why dual storage?**
+- Reflex requires localStorage for its internal WebSocket authentication
+- HttpOnly cookies cannot be read by JavaScript (XSS protection)
+- The middleware validates the HttpOnly cookie before serving pages
+- Even if localStorage is compromised via XSS, protected routes remain secure
 
 ### Recommended Production Setup
 
@@ -337,9 +379,11 @@ reflex_local_auth.configure_middleware(
     public_routes={"/login", "/register"},
 )
 
-# 2. Add middleware to app
+# 2. Add BOTH middleware AND auth API to app
 app = rx.App(
-    api_transformer=reflex_local_auth.AuthMiddleware,
+    api_transformer=lambda api: reflex_local_auth.setup_auth_api(
+        reflex_local_auth.AuthMiddleware(api)
+    ),
 )
 
 # 3. Still use @require_login as defense-in-depth
@@ -347,6 +391,30 @@ app = rx.App(
 @reflex_local_auth.require_login
 def protected_page():
     return rx.text("Protected content")
+```
+
+### Using the Auth API from Custom Login Forms
+
+If you create a custom login form, use the API endpoints to set the HttpOnly cookie:
+
+```python
+import reflex as rx
+
+class LoginState(rx.State):
+    error_message: str = ""
+
+    async def handle_login(self, form_data: dict):
+        # Call the auth API to set HttpOnly cookie
+        response = await self._call_login_api(
+            form_data["username"],
+            form_data["password"]
+        )
+        if response["success"]:
+            # Also set localStorage for Reflex state compatibility
+            self._login(response["user_id"])
+            return rx.redirect("/dashboard")
+        else:
+            self.error_message = response["message"]
 ```
 
 ### Open Redirect Prevention

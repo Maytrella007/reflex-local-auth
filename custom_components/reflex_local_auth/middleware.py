@@ -16,12 +16,16 @@ Usage:
 from __future__ import annotations
 
 import datetime
+import logging
 from typing import TYPE_CHECKING, Callable, Optional, Set, Tuple
 from urllib.parse import quote, urlparse
 
 from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+# Configure module logger
+logger = logging.getLogger("reflex_local_auth")
 
 if TYPE_CHECKING:
     from .user import LocalUser
@@ -47,7 +51,7 @@ DEFAULT_PUBLIC_PREFIXES: Tuple[str, ...] = (
     "/static/",
     "/_upload/",
     "/_event/",
-    "/api/",
+    "/api/auth/",  # Auth API endpoints must be public
 )
 
 DEFAULT_FILE_EXTENSIONS: Tuple[str, ...] = (
@@ -214,7 +218,7 @@ def _validate_session(session_id: str) -> Optional["LocalUser"]:
 
     except Exception as e:
         # Log error but don't expose details
-        print(f"[reflex-local-auth] Session validation error: {type(e).__name__}")
+        logger.warning("Session validation error: %s", type(e).__name__)
 
     return None
 
@@ -278,7 +282,8 @@ class AuthMiddleware:
         login_route = _config["login_route"]
 
         # Handle login page when already authenticated
-        if path == login_route or path == "/":
+        # Only apply to the configured login_route, not "/" generically
+        if path == login_route:
             if is_authenticated:
                 # Redirect to default authenticated route
                 redirect_url = _config["default_authenticated_route"]
@@ -286,9 +291,8 @@ class AuthMiddleware:
                 await response(scope, receive, send)
                 return
             # Not authenticated on login page - allow through
-            if path == login_route:
-                await self.app(scope, receive, send)
-                return
+            await self.app(scope, receive, send)
+            return
 
         # Protected routes - require authentication
         if not is_authenticated:
