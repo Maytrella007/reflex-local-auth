@@ -20,11 +20,14 @@ from __future__ import annotations
 
 import datetime
 import logging
-from typing import TYPE_CHECKING, Optional
+import time
+from collections import defaultdict
+from threading import Lock
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlmodel import select
 
 if TYPE_CHECKING:
@@ -40,6 +43,84 @@ from .middleware import (
 )
 
 logger = logging.getLogger("reflex_local_auth")
+
+# Rate limiting configuration
+RATE_LIMIT_MAX_ATTEMPTS = 5  # Max login attempts
+RATE_LIMIT_WINDOW_SECONDS = 300  # 5 minute window
+RATE_LIMIT_LOCKOUT_SECONDS = 900  # 15 minute lockout after max attempts
+
+# Thread-safe rate limiting storage
+_rate_limit_lock = Lock()
+_rate_limit_attempts: Dict[str, List[float]] = defaultdict(list)
+
+
+def _get_client_ip(request: Request) -> str:
+    """Get the client IP address from request headers.
+
+    Handles X-Forwarded-For for proxy setups.
+
+    Args:
+        request: The FastAPI request object.
+
+    Returns:
+        The client IP address.
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        # Take the first IP in the chain (original client)
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _check_rate_limit(client_ip: str) -> Tuple[bool, int]:
+    """Check if the client is rate limited.
+
+    Args:
+        client_ip: The client's IP address.
+
+    Returns:
+        Tuple of (is_allowed, seconds_until_allowed).
+    """
+    current_time = time.time()
+    window_start = current_time - RATE_LIMIT_WINDOW_SECONDS
+
+    with _rate_limit_lock:
+        # Clean old attempts outside the window
+        _rate_limit_attempts[client_ip] = [
+            t for t in _rate_limit_attempts[client_ip]
+            if t > window_start
+        ]
+
+        attempts = _rate_limit_attempts[client_ip]
+
+        if len(attempts) >= RATE_LIMIT_MAX_ATTEMPTS:
+            # Check if still in lockout period
+            oldest_attempt = min(attempts) if attempts else current_time
+            lockout_end = oldest_attempt + RATE_LIMIT_LOCKOUT_SECONDS
+            if current_time < lockout_end:
+                return False, int(lockout_end - current_time)
+
+        return True, 0
+
+
+def _record_failed_attempt(client_ip: str) -> None:
+    """Record a failed login attempt.
+
+    Args:
+        client_ip: The client's IP address.
+    """
+    with _rate_limit_lock:
+        _rate_limit_attempts[client_ip].append(time.time())
+
+
+def _clear_rate_limit(client_ip: str) -> None:
+    """Clear rate limiting for a client after successful login.
+
+    Args:
+        client_ip: The client's IP address.
+    """
+    with _rate_limit_lock:
+        _rate_limit_attempts[client_ip] = []
 
 # API Router for auth endpoints
 auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -240,6 +321,8 @@ async def login(request: Request, credentials: LoginRequest) -> Response:
     if successful, sets an HttpOnly cookie that cannot be accessed
     by JavaScript, providing protection against XSS attacks.
 
+    Rate limiting is applied to prevent brute force attacks.
+
     Args:
         request: The FastAPI request object.
         credentials: The login credentials (username, password).
@@ -247,10 +330,30 @@ async def login(request: Request, credentials: LoginRequest) -> Response:
     Returns:
         JSON response with success status and Set-Cookie header.
     """
+    # Check rate limiting
+    client_ip = _get_client_ip(request)
+    is_allowed, retry_after = _check_rate_limit(client_ip)
+
+    if not is_allowed:
+        logger.warning("Rate limit exceeded for IP: %s", client_ip)
+        response = JSONResponse(
+            status_code=429,
+            content={
+                "success": False,
+                "message": f"Too many login attempts. Try again in {retry_after} seconds.",
+                "user_id": None,
+                "username": None,
+            }
+        )
+        response.headers["Retry-After"] = str(retry_after)
+        return response
+
     # Validate credentials
     user = _validate_credentials(credentials.username, credentials.password)
 
     if user is None:
+        # Record failed attempt for rate limiting
+        _record_failed_attempt(client_ip)
         return JSONResponse(
             status_code=401,
             content={
@@ -295,6 +398,9 @@ async def login(request: Request, credentials: LoginRequest) -> Response:
         secure=_config.get("cookie_secure", False),
         httponly=AUTH_COOKIE_HTTPONLY,
     )
+
+    # Clear rate limiting on successful login
+    _clear_rate_limit(client_ip)
 
     logger.info("User %s logged in successfully", user["username"])
 

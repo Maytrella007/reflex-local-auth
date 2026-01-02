@@ -13,7 +13,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import sys
-sys.path.insert(0, '/mnt/c/Users/goosnet/Desktop/reflex-local-auth/custom_components')
+from pathlib import Path
+
+# Add custom_components to path relative to this test file
+_test_dir = Path(__file__).parent
+_custom_components = _test_dir.parent / "custom_components"
+sys.path.insert(0, str(_custom_components))
 
 from reflex_local_auth.auth_api import (
     auth_router,
@@ -22,6 +27,11 @@ from reflex_local_auth.auth_api import (
     _create_session,
     _get_user_from_session,
     _invalidate_session,
+    _check_rate_limit,
+    _record_failed_attempt,
+    _clear_rate_limit,
+    _rate_limit_attempts,
+    RATE_LIMIT_MAX_ATTEMPTS,
 )
 from reflex_local_auth.middleware import AUTH_COOKIE_NAME
 
@@ -277,6 +287,80 @@ class TestFullAuthFlow:
             logout_response = client.post("/api/auth/logout")
             assert logout_response.status_code == 200
             assert logout_response.json()["success"] is True
+
+
+class TestRateLimiting:
+    """Tests for login rate limiting."""
+
+    def setup_method(self):
+        """Clear rate limiting state before each test."""
+        _rate_limit_attempts.clear()
+
+    def test_rate_limit_allows_initial_attempts(self):
+        """Initial attempts should be allowed."""
+        is_allowed, _ = _check_rate_limit("192.168.1.1")
+        assert is_allowed is True
+
+    def test_rate_limit_blocks_after_max_attempts(self):
+        """After max attempts, client should be blocked."""
+        client_ip = "192.168.1.2"
+
+        # Record max failed attempts
+        for _ in range(RATE_LIMIT_MAX_ATTEMPTS):
+            _record_failed_attempt(client_ip)
+
+        is_allowed, retry_after = _check_rate_limit(client_ip)
+        assert is_allowed is False
+        assert retry_after > 0
+
+    def test_rate_limit_clears_on_success(self):
+        """Rate limit should clear after successful login."""
+        client_ip = "192.168.1.3"
+
+        # Record some failed attempts
+        for _ in range(3):
+            _record_failed_attempt(client_ip)
+
+        # Clear rate limit (simulating successful login)
+        _clear_rate_limit(client_ip)
+
+        is_allowed, _ = _check_rate_limit(client_ip)
+        assert is_allowed is True
+
+    def test_rate_limit_returns_429(self, client):
+        """Rate limited requests should return 429."""
+        client_ip = "testclient"  # TestClient uses "testclient" as client IP
+
+        # Record max failed attempts
+        for _ in range(RATE_LIMIT_MAX_ATTEMPTS):
+            _record_failed_attempt(client_ip)
+
+        with patch('reflex_local_auth.auth_api._validate_credentials') as mock_validate:
+            mock_validate.return_value = None
+
+            response = client.post("/api/auth/login", json={
+                "username": "testuser",
+                "password": "wrongpassword"
+            })
+
+            assert response.status_code == 429
+            assert "Retry-After" in response.headers
+
+    def test_failed_login_records_attempt(self, client):
+        """Failed login should record an attempt."""
+        _rate_limit_attempts.clear()
+
+        with patch('reflex_local_auth.auth_api._validate_credentials') as mock_validate:
+            mock_validate.return_value = None
+
+            client.post("/api/auth/login", json={
+                "username": "testuser",
+                "password": "wrongpassword"
+            })
+
+            # Check that an attempt was recorded
+            # TestClient uses "testclient" as the client host
+            assert len(_rate_limit_attempts.get("testclient", [])) >= 1
 
 
 # Run tests with: pytest tests/test_auth_api.py -v

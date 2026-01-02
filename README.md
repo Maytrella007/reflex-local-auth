@@ -395,26 +395,88 @@ def protected_page():
 
 ### Using the Auth API from Custom Login Forms
 
-If you create a custom login form, use the API endpoints to set the HttpOnly cookie:
+For full security, your login flow should:
+1. Call the API to set the HttpOnly cookie (middleware protection)
+2. Set localStorage token for Reflex state compatibility
+
+**Complete Login Example:**
 
 ```python
 import reflex as rx
+import reflex_local_auth
 
-class LoginState(rx.State):
+class MyLoginState(reflex_local_auth.LocalAuthState):
     error_message: str = ""
+    is_loading: bool = False
 
-    async def handle_login(self, form_data: dict):
-        # Call the auth API to set HttpOnly cookie
-        response = await self._call_login_api(
-            form_data["username"],
-            form_data["password"]
+    @rx.event
+    def handle_submit(self, form_data: dict):
+        """Handle login form submission."""
+        self.is_loading = True
+        self.error_message = ""
+
+        # The login is handled in two parts:
+        # 1. JavaScript calls /api/auth/login to set HttpOnly cookie
+        # 2. On success, we call _login() to set localStorage
+        yield rx.call_script(
+            f"""
+            fetch('/api/auth/login', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                credentials: 'include',
+                body: JSON.stringify({{
+                    username: '{form_data.get("username", "")}',
+                    password: '{form_data.get("password", "")}'
+                }})
+            }})
+            .then(r => r.json())
+            .then(data => {{
+                if (data.success) {{
+                    // Dispatch event to complete login in Reflex state
+                    window.dispatchEvent(new CustomEvent('login_success',
+                        {{detail: {{user_id: data.user_id}}}}));
+                }} else {{
+                    window.dispatchEvent(new CustomEvent('login_error',
+                        {{detail: {{message: data.message}}}}));
+                }}
+            }})
+            """
         )
-        if response["success"]:
-            # Also set localStorage for Reflex state compatibility
-            self._login(response["user_id"])
-            return rx.redirect("/dashboard")
-        else:
-            self.error_message = response["message"]
+
+    @rx.event
+    def on_login_success(self, user_id: int):
+        """Complete login by setting localStorage."""
+        self._login(user_id)
+        self.is_loading = False
+        return rx.redirect("/dashboard")
+
+    @rx.event
+    def on_login_error(self, message: str):
+        """Handle login error."""
+        self.error_message = message
+        self.is_loading = False
+```
+
+**Complete Logout Example:**
+
+```python
+    @rx.event
+    def handle_logout(self):
+        """Logout from both HttpOnly cookie and localStorage."""
+        # 1. Clear localStorage (Reflex state)
+        self.do_logout()
+
+        # 2. Clear HttpOnly cookie via API
+        yield rx.call_script(
+            """
+            fetch('/api/auth/logout', {
+                method: 'POST',
+                credentials: 'include'
+            }).then(() => {
+                window.location.href = '/login';
+            });
+            """
+        )
 ```
 
 ### Open Redirect Prevention
@@ -423,6 +485,32 @@ The `?next=` parameter is validated to prevent open redirect attacks:
 - Only relative URLs are allowed (must start with `/`)
 - Protocol injection is blocked (`://`)
 - Path traversal is blocked (`..`)
+
+**Important:** When handling the `next` parameter after login, always validate it:
+
+```python
+import reflex_local_auth
+
+class LoginState(rx.State):
+    def handle_login_success(self):
+        # Get next parameter from URL
+        next_url = self.router.page.params.get("next", "/dashboard")
+
+        # ALWAYS validate before redirecting
+        if reflex_local_auth.is_safe_redirect_url(next_url):
+            return rx.redirect(next_url)
+        else:
+            return rx.redirect("/dashboard")  # Fallback to safe default
+```
+
+### Rate Limiting
+
+Login attempts are rate limited to prevent brute force attacks:
+- Maximum 5 attempts per 5-minute window
+- 15-minute lockout after exceeding limit
+- Rate limit clears on successful login
+
+Rate-limited requests receive HTTP 429 with a `Retry-After` header.
 
 ## Contributing
 

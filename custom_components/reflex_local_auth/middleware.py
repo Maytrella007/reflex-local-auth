@@ -266,8 +266,25 @@ class AuthMiddleware:
 
         request = Request(scope, receive)
         path = request.url.path
+        login_route = _config["login_route"]
 
-        # Allow public routes and static files
+        # Handle login page specially (before public route check)
+        # This allows redirecting authenticated users away from login
+        if path == login_route:
+            session_id = request.cookies.get(AUTH_COOKIE_NAME)
+            user = _validate_session(session_id) if session_id else None
+
+            if user is not None:
+                # Authenticated user on login - redirect to dashboard
+                redirect_url = _config["default_authenticated_route"]
+                response = RedirectResponse(url=redirect_url, status_code=303)
+                await response(scope, receive, send)
+                return
+            # Not authenticated on login page - allow through
+            await self.app(scope, receive, send)
+            return
+
+        # Allow public routes and static files (except login, handled above)
         if self._is_public(path):
             await self.app(scope, receive, send)
             return
@@ -278,21 +295,6 @@ class AuthMiddleware:
         # Validate session
         user = _validate_session(session_id) if session_id else None
         is_authenticated = user is not None
-
-        login_route = _config["login_route"]
-
-        # Handle login page when already authenticated
-        # Only apply to the configured login_route, not "/" generically
-        if path == login_route:
-            if is_authenticated:
-                # Redirect to default authenticated route
-                redirect_url = _config["default_authenticated_route"]
-                response = RedirectResponse(url=redirect_url, status_code=303)
-                await response(scope, receive, send)
-                return
-            # Not authenticated on login page - allow through
-            await self.app(scope, receive, send)
-            return
 
         # Protected routes - require authentication
         if not is_authenticated:

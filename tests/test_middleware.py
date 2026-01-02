@@ -12,7 +12,17 @@ from starlette.responses import Response
 
 # Import the module under test
 import sys
-sys.path.insert(0, '/mnt/c/Users/goosnet/Desktop/reflex-local-auth/custom_components')
+from pathlib import Path
+
+# Add custom_components to path relative to this test file
+_test_dir = Path(__file__).parent
+_custom_components = _test_dir.parent / "custom_components"
+sys.path.insert(0, str(_custom_components))
+
+from unittest.mock import patch, MagicMock, AsyncMock
+from starlette.testclient import TestClient
+from starlette.applications import Starlette
+from starlette.routing import Route
 
 from reflex_local_auth.middleware import (
     is_safe_redirect_url,
@@ -22,6 +32,7 @@ from reflex_local_auth.middleware import (
     _config,
     DEFAULT_PUBLIC_ROUTES,
     AUTH_COOKIE_NAME,
+    AuthMiddleware,
 )
 
 
@@ -215,6 +226,205 @@ class TestSecurityEdgeCases:
         """Unicode characters in path should be handled."""
         result = is_safe_redirect_url("/página/información")
         assert result is True  # Unicode paths are valid
+
+
+class TestAuthMiddlewareASGI:
+    """Tests for the AuthMiddleware ASGI behavior."""
+
+    def setup_method(self):
+        """Reset configuration before each test."""
+        configure_middleware(
+            public_routes={"/login", "/register", "/public"},
+            login_route="/login",
+            default_authenticated_route="/dashboard",
+            cookie_secure=False,
+            enabled=True,
+        )
+
+    def _create_test_app(self):
+        """Create a test Starlette app wrapped with AuthMiddleware."""
+        async def homepage(request):
+            from starlette.responses import PlainTextResponse
+            return PlainTextResponse("Protected Home")
+
+        async def dashboard(request):
+            from starlette.responses import PlainTextResponse
+            return PlainTextResponse("Protected Dashboard")
+
+        async def login_page(request):
+            from starlette.responses import PlainTextResponse
+            return PlainTextResponse("Login Page")
+
+        async def public_page(request):
+            from starlette.responses import PlainTextResponse
+            return PlainTextResponse("Public Page")
+
+        routes = [
+            Route("/", homepage),
+            Route("/dashboard", dashboard),
+            Route("/login", login_page),
+            Route("/public", public_page),
+        ]
+        app = Starlette(routes=routes)
+        return AuthMiddleware(app)
+
+    def test_unauthenticated_protected_route_redirects(self):
+        """Unauthenticated user accessing protected route should redirect to login."""
+        with patch('reflex_local_auth.middleware._validate_session') as mock_validate:
+            mock_validate.return_value = None
+
+            app = self._create_test_app()
+            client = TestClient(app, follow_redirects=False)
+
+            response = client.get("/dashboard")
+
+            assert response.status_code == 303
+            assert "/login" in response.headers["location"]
+            assert "next=" in response.headers["location"]
+
+    def test_authenticated_protected_route_allowed(self):
+        """Authenticated user accessing protected route should be allowed."""
+        mock_user = MagicMock()
+        mock_user.id = 1
+        mock_user.username = "testuser"
+
+        with patch('reflex_local_auth.middleware._validate_session') as mock_validate:
+            mock_validate.return_value = mock_user
+
+            app = self._create_test_app()
+            client = TestClient(app, follow_redirects=False)
+            client.cookies.set(AUTH_COOKIE_NAME, "valid_session")
+
+            response = client.get("/dashboard")
+
+            assert response.status_code == 200
+            assert "Protected Dashboard" in response.text
+
+    def test_authenticated_login_page_redirects(self):
+        """Authenticated user accessing login page should redirect to dashboard."""
+        mock_user = MagicMock()
+        mock_user.id = 1
+        mock_user.username = "testuser"
+
+        with patch('reflex_local_auth.middleware._validate_session') as mock_validate:
+            mock_validate.return_value = mock_user
+
+            app = self._create_test_app()
+            client = TestClient(app, follow_redirects=False)
+            client.cookies.set(AUTH_COOKIE_NAME, "valid_session")
+
+            response = client.get("/login")
+
+            assert response.status_code == 303
+            assert response.headers["location"] == "/dashboard"
+
+    def test_unauthenticated_login_page_allowed(self):
+        """Unauthenticated user accessing login page should be allowed."""
+        with patch('reflex_local_auth.middleware._validate_session') as mock_validate:
+            mock_validate.return_value = None
+
+            app = self._create_test_app()
+            client = TestClient(app, follow_redirects=False)
+
+            response = client.get("/login")
+
+            assert response.status_code == 200
+            assert "Login Page" in response.text
+
+    def test_public_route_always_allowed(self):
+        """Public routes should be accessible without authentication."""
+        with patch('reflex_local_auth.middleware._validate_session') as mock_validate:
+            mock_validate.return_value = None
+
+            app = self._create_test_app()
+            client = TestClient(app, follow_redirects=False)
+
+            response = client.get("/public")
+
+            assert response.status_code == 200
+            assert "Public Page" in response.text
+            # Validate that session was not even checked for public routes
+            mock_validate.assert_not_called()
+
+    def test_static_files_allowed(self):
+        """Static files should be allowed without authentication."""
+        with patch('reflex_local_auth.middleware._validate_session') as mock_validate:
+            mock_validate.return_value = None
+
+            app = self._create_test_app()
+            client = TestClient(app, follow_redirects=False)
+
+            # Static files return 404 (no route) but should not redirect
+            response = client.get("/static/style.css")
+
+            # Should NOT redirect to login (file extensions are public)
+            assert response.status_code != 303
+
+    def test_middleware_disabled(self):
+        """Disabled middleware should pass all requests through."""
+        configure_middleware(enabled=False)
+
+        with patch('reflex_local_auth.middleware._validate_session') as mock_validate:
+            mock_validate.return_value = None
+
+            app = self._create_test_app()
+            client = TestClient(app, follow_redirects=False)
+
+            response = client.get("/dashboard")
+
+            # Should NOT redirect when middleware is disabled
+            assert response.status_code == 200
+            assert "Protected Dashboard" in response.text
+
+    def test_redirect_preserves_next_url(self):
+        """Redirect to login should preserve the original URL in ?next= param."""
+        with patch('reflex_local_auth.middleware._validate_session') as mock_validate:
+            mock_validate.return_value = None
+
+            app = self._create_test_app()
+            client = TestClient(app, follow_redirects=False)
+
+            response = client.get("/dashboard")
+
+            location = response.headers["location"]
+            assert "next=%2Fdashboard" in location  # URL-encoded /dashboard
+
+
+class TestMiddlewareIsPublic:
+    """Tests for the _is_public method."""
+
+    def setup_method(self):
+        """Reset configuration before each test."""
+        configure_middleware(
+            public_routes={"/login", "/register"},
+            public_prefixes=("/_next/", "/static/", "/api/auth/"),
+            login_route="/login",
+            enabled=True,
+        )
+
+    def test_exact_route_match(self):
+        """Exact public routes should be public."""
+        app = AuthMiddleware(MagicMock())
+        assert app._is_public("/login") is True
+        assert app._is_public("/register") is True
+        assert app._is_public("/dashboard") is False
+
+    def test_prefix_match(self):
+        """Routes with public prefixes should be public."""
+        app = AuthMiddleware(MagicMock())
+        assert app._is_public("/_next/static/chunk.js") is True
+        assert app._is_public("/static/style.css") is True
+        assert app._is_public("/api/auth/login") is True
+        assert app._is_public("/api/private") is False
+
+    def test_file_extension_match(self):
+        """Static file extensions should be public."""
+        app = AuthMiddleware(MagicMock())
+        assert app._is_public("/custom.js") is True
+        assert app._is_public("/style.css") is True
+        assert app._is_public("/favicon.ico") is True
+        assert app._is_public("/image.png") is True
+        assert app._is_public("/page") is False
 
 
 # Run tests with: pytest tests/test_middleware.py -v
